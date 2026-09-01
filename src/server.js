@@ -22,6 +22,10 @@ export async function buildServer() {
   const app = Fastify({
     logger: { transport: process.stdout.isTTY ? { target: 'pino-pretty' } : undefined },
     bodyLimit: config.maxUploadBytes,
+    // 所有路由都在 /api 底下。掛在子路徑跑的環境（cPanel 的 Node.js App 掛在
+    // /api）有可能把該前綴從 req.url 去掉，這裡補回來，讓同一份程式在本機與
+    // 主機上都對得到路由。
+    rewriteUrl: (req) => (req.url.startsWith('/api') ? req.url : `/api${req.url}`),
   });
 
   await app.register(cors, {
