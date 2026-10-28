@@ -1,4 +1,10 @@
 node_modules/
 .data/
 uploads/
+
+# 環境變數：.env 與所有變體一律不進版控，只保留 .env.example 範本
 .env
+.env.*
+!.env.example
+
+.DS_Store

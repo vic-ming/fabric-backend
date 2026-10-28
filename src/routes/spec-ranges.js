@@ -7,6 +7,7 @@
 
 import { many, one, query } from '../db/index.js';
 import { requireAdmin } from '../lib/auth.js';
+import { registerBatchDelete } from '../lib/batch-delete.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { requireInt, requireNumber, requireText } from '../lib/validate.js';
 
@@ -132,11 +133,17 @@ export default async function specRangeRoutes(app) {
     return view(await one(`${SELECT} where s.id = $1`, [current.id]));
   });
 
-  app.delete('/api/admin/spec-ranges/:id', async (request, reply) => {
-    const current = await one('select * from spec_ranges where id = $1', [request.params.id]);
+  async function deleteRange(id) {
+    const current = await one('select * from spec_ranges where id = $1', [id]);
     if (!current) throw notFound('範圍設定不存在');
     if (current.customer_id === null) throw badRequest('全域預設不可刪除');
     await query('delete from spec_ranges where id = $1', [current.id]);
+  }
+
+  app.delete('/api/admin/spec-ranges/:id', async (request, reply) => {
+    await deleteRange(Number(request.params.id));
     reply.code(204);
   });
+
+  registerBatchDelete(app, '/api/admin/spec-ranges', deleteRange);
 }

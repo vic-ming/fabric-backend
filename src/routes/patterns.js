@@ -13,6 +13,7 @@
 
 import { many, one, query } from '../db/index.js';
 import { requireAdmin } from '../lib/auth.js';
+import { registerBatchDelete } from '../lib/batch-delete.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { IMAGE_MIME, removeFile, saveUpload } from '../lib/files.js';
 import { pageResult, parsePaging, requireInt, requireNumber, requireOneOf, requireText } from '../lib/validate.js';
@@ -67,15 +68,34 @@ export default async function patternRoutes(app) {
     return { id: row.id, name: row.name };
   });
 
-  app.delete('/api/admin/pattern-categories/:id', async (request, reply) => {
-    const id = Number(request.params.id);
+  app.put('/api/admin/pattern-categories/:id', async (request) => {
+    const current = await one('select * from pattern_categories where id = $1', [request.params.id]);
+    if (!current) throw notFound('分類不存在');
+    const name = requireText(request.body?.name, '分類名稱', 50);
+    if (await one('select id from pattern_categories where name = $1 and id <> $2', [name, current.id])) {
+      throw conflict(`分類「${name}」已存在`);
+    }
+    const row = await one(
+      'update pattern_categories set name = $2 where id = $1 returning *',
+      [current.id, name],
+    );
+    return { id: row.id, name: row.name };
+  });
+
+  async function deleteCategory(id) {
     const current = await one('select * from pattern_categories where id = $1', [id]);
     if (!current) throw notFound('分類不存在');
     const { count } = await one('select count(*)::int as count from patterns where category_id = $1', [id]);
     if (count > 0) throw badRequest(`「${current.name}」底下尚有 ${count} 張圖片，不得刪除`);
     await query('delete from pattern_categories where id = $1', [id]);
+  }
+
+  app.delete('/api/admin/pattern-categories/:id', async (request, reply) => {
+    await deleteCategory(Number(request.params.id));
     reply.code(204);
   });
+
+  registerBatchDelete(app, '/api/admin/pattern-categories', deleteCategory);
 
   // ------------------------------------------------------------ 印花圖片
 
@@ -112,8 +132,9 @@ export default async function patternRoutes(app) {
     return pageResult(rows.map(view), count, paging);
   });
 
-  // 多檔上傳。欄位與檔案混在同一個 multipart 請求裡，
-  // 因此先收齊所有欄位與檔案再一起驗證，避免欄位順序影響結果。
+  // 單張上傳。原本支援多檔，但每張印花都要有自己的設計尺寸，
+  // 多檔上傳時無法逐張指定，因此改為一次一張。
+  // 欄位與檔案混在同一個 multipart 請求裡，先收齊再一起驗證，避免欄位順序影響結果。
   app.post('/api/admin/patterns', async (request, reply) => {
     if (!request.isMultipart()) throw badRequest('請以 multipart/form-data 上傳');
 
@@ -121,6 +142,7 @@ export default async function patternRoutes(app) {
     const uploads = [];
     for await (const part of request.parts()) {
       if (part.type === 'file') {
+        if (uploads.length > 0) throw badRequest('一次只能上傳一張印花圖片');
         uploads.push(await saveUpload(part, 'patterns', IMAGE_MIME));
       } else {
         fields[part.fieldname] = part.value;
@@ -145,26 +167,23 @@ export default async function patternRoutes(app) {
         }
       }
 
-      // 名稱為選填，未填寫則預設使用檔名；多檔上傳時名稱一律取各自檔名
+      // 名稱為選填，未填寫則預設使用檔名
       const givenName = requireText(fields.name, '名稱', 255, { required: false });
-      const width = requireNumber(fields.physicalWidthCm, '圖案實際寬度', { required: false, min: 0.001 });
-      const height = requireNumber(fields.physicalHeightCm, '圖案實際高度', { required: false, min: 0.001 });
+      // 畫面標示為「圖案設計尺寸」，欄位沿用既有的 physical_* 以免動到資料結構
+      const width = requireNumber(fields.physicalWidthCm, '圖案設計寬度', { required: false, min: 0.001 });
+      const height = requireNumber(fields.physicalHeightCm, '圖案設計高度', { required: false, min: 0.001 });
 
-      const created = [];
-      for (const [index, file] of uploads.entries()) {
-        const name = uploads.length === 1 && givenName ? givenName : file.original_name;
-        const row = await one(
-          `insert into patterns (kind, category_id, customer_id, name, file_id,
-                                 physical_width_cm, physical_height_cm)
-           values ($1, $2, $3, $4, $5, $6, $7) returning id`,
-          [kind, categoryId, customerId, name, file.id, width, height],
-        );
-        created.push(row.id);
-        void index;
-      }
+      const file = uploads[0];
+      const created = await one(
+        `insert into patterns (kind, category_id, customer_id, name, file_id,
+                               physical_width_cm, physical_height_cm)
+         values ($1, $2, $3, $4, $5, $6, $7) returning id`,
+        [kind, categoryId, customerId, givenName || file.original_name, file.id, width, height],
+      );
 
       reply.code(201);
-      return many(`${SELECT} where p.id = any($1::int[]) order by p.id`, [created]).then((rows) => rows.map(view));
+      const row = await one(`${SELECT} where p.id = $1`, [created.id]);
+      return view(row);
     } catch (error) {
       // 驗證失敗時把已落地的檔案清掉，不留孤兒
       for (const file of uploads) await removeFile(file.id).catch(() => {});
@@ -208,11 +227,17 @@ export default async function patternRoutes(app) {
     return view(await one(`${SELECT} where p.id = $1`, [current.id]));
   });
 
-  app.delete('/api/admin/patterns/:id', async (request, reply) => {
-    const current = await one('select * from patterns where id = $1', [request.params.id]);
+  async function deletePattern(id) {
+    const current = await one('select * from patterns where id = $1', [id]);
     if (!current) throw notFound('印花不存在');
     await query('delete from patterns where id = $1', [current.id]);
-    await removeFile(current.file_id);
+    await removeFile(current.file_id).catch(() => {});
+  }
+
+  app.delete('/api/admin/patterns/:id', async (request, reply) => {
+    await deletePattern(Number(request.params.id));
     reply.code(204);
   });
+
+  registerBatchDelete(app, '/api/admin/patterns', deletePattern);
 }

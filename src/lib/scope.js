@@ -5,8 +5,8 @@
 // 且都附註「當選擇指定客戶時，至少需選擇一項始得儲存」。
 // 這裡把該規則集中一處，避免七份重複實作。
 
-import { many, query } from '../db/index.js';
-import { badRequest } from './errors.js';
+import { many, one, query } from '../db/index.js';
+import { badRequest, conflict } from './errors.js';
 import { requireIdArray, requireOneOf } from './validate.js';
 
 export const ENTITY = {
@@ -17,6 +17,7 @@ export const ENTITY = {
   weaveSpec: 'weave_spec',
   background: 'background',
   model3d: 'model_3d',
+  pantone: 'pantone',
 };
 
 /** 解析並驗證前端送來的適用對象設定。未指定時預設為全域。 */
@@ -29,6 +30,47 @@ export function parseScope(body) {
     throw badRequest('選擇指定客戶時，至少需選擇一位客戶');
   }
   return { scopeType, customerIds };
+}
+
+/**
+ * 編碼「同公司不可重複、跨公司可重複」。
+ *
+ * 可不可以重複取決於兩筆資料有沒有共同的可見對象，所以沒辦法用唯一索引表達：
+ *   ・新資料是全域 → 所有公司都看得到，與表內任何一筆同編碼者都衝突
+ *   ・新資料指定客戶 → 只跟「全域」或「同樣指定到這幾間公司」的資料衝突
+ * 例：甲公司與乙公司可以各有一個編碼 WO 的布樣種類，但若已存在一筆全域的 WO，
+ * 兩家都看得到它，就不能再建。
+ *
+ * sameAs 讓編碼搭配其他欄位一起判斷，例如 Pantone 是「同系列內」色號不可重複：
+ *   sameAs = { color_type: 'TPX' } → 只有色號相同、且系列也相同才算撞號。
+ *
+ * table 與 sameAs 的欄位名稱只由程式內的呼叫端以常數傳入，不接受外部輸入。
+ */
+export async function assertScopedCodeUnique({
+  table, entityType, code, scope, excludeId = null, label = '編碼', sameAs = {},
+}) {
+  const extra = Object.entries(sameAs);
+  const extraSql = extra
+    .map(([column], i) => `and t.${column} is not distinct from $${6 + i}`)
+    .join(' ');
+  const clash = await one(
+    `select t.id from ${table} t
+      where t.code = $1
+        and ($2::int is null or t.id <> $2)
+        ${extraSql}
+        and ($3
+             or t.scope_type = 'global'
+             or exists (select 1 from scope_customers sc
+                         where sc.entity_type = $4
+                           and sc.entity_id = t.id
+                           and sc.customer_id = any($5::int[])))
+      limit 1`,
+    [code, excludeId, scope.scopeType === 'global', entityType, scope.customerIds,
+     ...extra.map(([, value]) => value)],
+  );
+  if (clash) {
+    throw conflict(`${label} ${code} 已被同一適用對象的資料使用，不得重複`);
+  }
 }
 
 /** 確認客戶皆存在，避免寫入孤兒關聯。 */

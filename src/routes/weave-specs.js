@@ -9,10 +9,15 @@
 
 import { many, one, query, tx } from '../db/index.js';
 import { requireAdmin } from '../lib/auth.js';
-import { badRequest, conflict, notFound } from '../lib/errors.js';
+import { registerBatchDelete } from '../lib/batch-delete.js';
+import { badRequest, notFound } from '../lib/errors.js';
 import { IMAGE_MIME, removeFile, saveUpload } from '../lib/files.js';
-import { ENTITY, assertCustomersExist, attachScope, clearScope, parseScope, writeScope } from '../lib/scope.js';
-import { pageResult, parsePaging, requireInt, requireNumber, requireText } from '../lib/validate.js';
+import { missingTextures, parseU3m } from '../lib/u3m.js';
+import {
+  ENTITY, assertCustomersExist, assertScopedCodeUnique,
+  attachScope, clearScope, parseScope, writeScope,
+} from '../lib/scope.js';
+import { pageResult, parsePaging, requireBool, requireInt, requireNumber, requireText } from '../lib/validate.js';
 
 const SELECT = `select ws.*, ft.name as fabric_type_name, w.name as weave_name,
                        pf.storage_key as preview_key, pf.original_name as preview_name
@@ -68,11 +73,43 @@ async function collectMultipart(request) {
       // 規格書：組織預覽圖 接受 JPG,PNG,GIF
       preview = await saveUpload(part, 'weave-specs/preview', IMAGE_MIME);
     } else {
-      // 規格書：組織資料 上傳任意檔案，不限制檔案數量和格式
-      dataFiles.push(await saveUpload(part, 'weave-specs/data'));
+      // 規格書：組織資料 上傳任意檔案，不限制檔案數量和格式。
+      // .u3m 要留下內容供解析（串流只能讀一次，事後讀不到）
+      const isU3m = /\.u3m$/i.test(part.filename ?? '');
+      dataFiles.push(await saveUpload(part, 'weave-specs/data', null, { keepBuffer: isU3m }));
     }
   }
   return { fields, preview, dataFiles };
+}
+
+/**
+ * 上傳的組織資料若含 .u3m，就解析它：
+ *   ・比對引用到的六張貼圖有沒有一起上傳，缺了就擋下並列出檔名
+ *   ・使用者沒填設計尺寸時，自動帶入 .u3m 記錄的實際尺寸
+ *
+ * @param alsoHaveNames 編輯時保留下來的舊檔名，一併算進「已經有的檔案」
+ */
+function applyU3m(dataFiles, size, alsoHaveNames = []) {
+  const u3mFile = dataFiles.find((f) => f.buffer && /\.u3m$/i.test(f.original_name ?? ''));
+  if (!u3mFile) return size;
+
+  const parsed = parseU3m(u3mFile.buffer);
+  if (!parsed) throw badRequest(`${u3mFile.original_name} 不是有效的 .u3m（內容無法解析）`);
+
+  const have = [...dataFiles.map((f) => f.original_name), ...alsoHaveNames];
+  const missing = missingTextures(parsed, have);
+  if (missing.length > 0) {
+    throw badRequest(
+      `${u3mFile.original_name} 需要搭配 ${parsed.textures.length} 張貼圖，`
+      + `還缺 ${missing.length} 張：${missing.map((p) => p.split('/').pop()).join('、')}`,
+    );
+  }
+
+  // 使用者沒填就用 .u3m 裡的實際尺寸；填了就尊重使用者的值
+  return {
+    designWidthCm: size.designWidthCm ?? parsed.designWidthCm,
+    designHeightCm: size.designHeightCm ?? parsed.designHeightCm,
+  };
 }
 
 async function loadOne(id) {
@@ -107,7 +144,10 @@ async function loadOne(id) {
     weight: Number(row.weight),
     thickness: Number(row.thickness),
     density: row.density,
+    designWidthCm: row.design_width_cm === null ? null : Number(row.design_width_cm),
+    designHeightCm: row.design_height_cm === null ? null : Number(row.design_height_cm),
     finishing: row.finishing,
+    isActive: row.is_active,
     preview: { id: row.preview_file_id, url: `/api/files/${row.preview_key}`, name: row.preview_name },
     files: files.map((f) => ({
       id: f.id, url: `/api/files/${f.storage_key}`, name: f.original_name,
@@ -153,6 +193,7 @@ export default async function weaveSpecRoutes(app) {
       weaveName: row.weave_name,
       weight: Number(row.weight),
       thickness: Number(row.thickness),
+      isActive: row.is_active,
       preview: { url: `/api/files/${row.preview_key}`, name: row.preview_name },
       scopeType: row.scope_type,
       customers: row.customers ?? [],
@@ -173,6 +214,13 @@ export default async function weaveSpecRoutes(app) {
       const thickness = requireNumber(fields.thickness, '布厚', { min: 0, max: 999.99, decimals: 2 });
       const density = requireText(fields.density, '經緯密度', 100, { required: false });
       const finishing = requireText(fields.finishing, '後整理', 100, { required: false });
+      // 組織在真實世界的尺寸，前台用它算貼圖在模型上的重複次數
+      const designWidthCm = requireNumber(fields.designWidthCm, '組織寬度 (cm)', {
+        min: 0.001, max: 99999, required: false, decimals: 3,
+      });
+      const designHeightCm = requireNumber(fields.designHeightCm, '組織高度 (cm)', {
+        min: 0.001, max: 99999, required: false, decimals: 3,
+      });
       const compositions = readCompositions(fields.compositions);
       const scope = parseScope({
         scopeType: fields.scopeType,
@@ -181,9 +229,10 @@ export default async function weaveSpecRoutes(app) {
 
       if (!preview) throw badRequest('組織預覽圖為必填');
       if (dataFiles.length === 0) throw badRequest('組織資料為必填，請至少上傳一個檔案');
-      if (await one('select id from weave_specs where code = $1', [code])) {
-        throw conflict(`編號 ${code} 已存在，不得重複`);
-      }
+      const size = applyU3m(dataFiles, { designWidthCm, designHeightCm });
+      await assertScopedCodeUnique({
+        table: 'weave_specs', entityType: ENTITY.weaveSpec, code, scope, label: '組織規格編號',
+      });
       await assertWeaveBelongs(fabricTypeId, weaveId);
       await assertCompositionsExist(compositions);
       await assertCustomersExist(scope.customerIds);
@@ -191,9 +240,11 @@ export default async function weaveSpecRoutes(app) {
       const created = await tx(async (dbx) => {
         const row = await dbx.query(
           `insert into weave_specs (code, fabric_type_id, weave_id, weight, thickness,
-                                    density, finishing, preview_file_id, scope_type)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9) returning id`,
-          [code, fabricTypeId, weaveId, weight, thickness, density, finishing, preview.id, scope.scopeType],
+                                    density, finishing, design_width_cm, design_height_cm,
+                                    preview_file_id, scope_type)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning id`,
+          [code, fabricTypeId, weaveId, weight, thickness, density, finishing,
+           size.designWidthCm, size.designHeightCm, preview.id, scope.scopeType],
         ).then((r) => r.rows[0]);
         await writeCompositions(dbx, row.id, compositions);
         await writeDataFiles(dbx, row.id, dataFiles.map((f) => f.id));
@@ -223,6 +274,13 @@ export default async function weaveSpecRoutes(app) {
       const thickness = requireNumber(fields.thickness, '布厚', { min: 0, max: 999.99, decimals: 2 });
       const density = requireText(fields.density, '經緯密度', 100, { required: false });
       const finishing = requireText(fields.finishing, '後整理', 100, { required: false });
+      // 組織在真實世界的尺寸，前台用它算貼圖在模型上的重複次數
+      const designWidthCm = requireNumber(fields.designWidthCm, '組織寬度 (cm)', {
+        min: 0.001, max: 99999, required: false, decimals: 3,
+      });
+      const designHeightCm = requireNumber(fields.designHeightCm, '組織高度 (cm)', {
+        min: 0.001, max: 99999, required: false, decimals: 3,
+      });
       const compositions = readCompositions(fields.compositions);
       const scope = parseScope({
         scopeType: fields.scopeType,
@@ -234,6 +292,11 @@ export default async function weaveSpecRoutes(app) {
       await assertWeaveBelongs(fabricTypeId, weaveId);
       await assertCompositionsExist(compositions);
       await assertCustomersExist(scope.customerIds);
+      // 適用對象改了，編號的可見範圍跟著變，要重新確認沒有撞號
+      await assertScopedCodeUnique({
+        table: 'weave_specs', entityType: ENTITY.weaveSpec, code: current.code,
+        scope, excludeId: current.id, label: '組織規格編號',
+      });
 
       const existingFiles = await many(
         'select file_id from weave_spec_files where weave_spec_id = $1', [current.id],
@@ -241,6 +304,11 @@ export default async function weaveSpecRoutes(app) {
       const kept = keepFileIds === null
         ? existingFiles
         : existingFiles.filter((id) => keepFileIds.map(Number).includes(id));
+      const keptNames = kept.length === 0 ? [] : await many(
+        'select original_name from files where id = any($1::int[])', [kept],
+      ).then((rows) => rows.map((r) => r.original_name));
+      const size = applyU3m(dataFiles, { designWidthCm, designHeightCm }, keptNames);
+
       if (kept.length + dataFiles.length === 0) {
         throw badRequest('組織資料為必填，請至少保留或上傳一個檔案');
       }
@@ -253,10 +321,11 @@ export default async function weaveSpecRoutes(app) {
         await dbx.query(
           `update weave_specs
               set fabric_type_id = $2, weave_id = $3, weight = $4, thickness = $5,
-                  density = $6, finishing = $7, preview_file_id = $8,
-                  scope_type = $9, updated_at = now()
+                  density = $6, finishing = $7, design_width_cm = $8, design_height_cm = $9,
+                  preview_file_id = $10, scope_type = $11, updated_at = now()
             where id = $1`,
           [current.id, fabricTypeId, weaveId, weight, thickness, density, finishing,
+           size.designWidthCm, size.designHeightCm,
            preview ? preview.id : current.preview_file_id, scope.scopeType],
         );
         await dbx.query('delete from weave_spec_compositions where weave_spec_id = $1', [current.id]);
@@ -277,8 +346,20 @@ export default async function weaveSpecRoutes(app) {
     }
   });
 
-  app.delete('/api/admin/weave-specs/:id', async (request, reply) => {
-    const current = await one('select * from weave_specs where id = $1', [request.params.id]);
+  // 啟用／停用（10/22 客戶要求）。停用的組織規格不出現在前台，後台清單仍看得到。
+  app.put('/api/admin/weave-specs/:id/active', async (request) => {
+    const current = await one('select id from weave_specs where id = $1', [request.params.id]);
+    if (!current) throw notFound('組織規格不存在');
+    const isActive = requireBool(request.body?.isActive, '啟用狀態');
+    await query(
+      'update weave_specs set is_active = $2, updated_at = now() where id = $1',
+      [current.id, isActive],
+    );
+    return loadOne(current.id);
+  });
+
+  async function deleteWeaveSpec(id) {
+    const current = await one('select * from weave_specs where id = $1', [id]);
     if (!current) throw notFound('組織規格不存在');
 
     const fileIds = await many(
@@ -289,10 +370,16 @@ export default async function weaveSpecRoutes(app) {
       await clearScope(dbx, ENTITY.weaveSpec, current.id);
       await dbx.query('delete from weave_specs where id = $1', [current.id]);
     });
-    for (const id of fileIds) await removeFile(id).catch(() => {});
+    for (const fileId of fileIds) await removeFile(fileId).catch(() => {});
     await removeFile(current.preview_file_id).catch(() => {});
+  }
+
+  app.delete('/api/admin/weave-specs/:id', async (request, reply) => {
+    await deleteWeaveSpec(Number(request.params.id));
     reply.code(204);
   });
+
+  registerBatchDelete(app, '/api/admin/weave-specs', deleteWeaveSpec);
 }
 
 async function assertWeaveBelongs(fabricTypeId, weaveId) {

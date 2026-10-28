@@ -1,4 +1,6 @@
-import { accountStatus, authenticate, isWithinValidPeriod, roleOf, signToken, verifyPassword } from '../lib/auth.js';
+import {
+  accountStatus, authenticate, isCustomerDisabled, isWithinValidPeriod, roleOf, signToken, verifyPassword,
+} from '../lib/auth.js';
 import { one } from '../db/index.js';
 import { toDateString } from '../lib/dates.js';
 import { forbidden, unauthorized } from '../lib/errors.js';
@@ -10,7 +12,7 @@ export default async function authRoutes(app) {
     const password = requireText(request.body?.password, '密碼', 50);
 
     const account = await one(
-      `select a.*, c.name as customer_name
+      `select a.*, c.name as customer_name, c.is_active as customer_active
          from accounts a
          left join customers c on c.id = a.customer_id
         where a.username = $1`,
@@ -20,8 +22,14 @@ export default async function authRoutes(app) {
     if (!account || !(await verifyPassword(password, account.password_hash))) {
       throw unauthorized('帳號或密碼錯誤');
     }
+    if (account.is_active === false) {
+      throw forbidden('帳號已停用，請聯絡管理者');
+    }
     if (!isWithinValidPeriod(account)) {
       throw forbidden('帳號不在生效期間內，請聯絡管理者');
+    }
+    if (isCustomerDisabled(account)) {
+      throw forbidden('所屬公司已停用，請聯絡管理者');
     }
 
     return {

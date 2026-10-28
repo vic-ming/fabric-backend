@@ -11,8 +11,10 @@ export const IMAGE_MIME = ['image/jpeg', 'image/png', 'image/gif', 'image/webp']
  * @param part  @fastify/multipart 的 file part
  * @param folder 儲存子目錄，例如 'patterns'
  * @param allowedMime 若給定則限制 MIME；不給代表不限格式（規格書：組織資料不限檔案格式）
+ * @param keepBuffer  一併回傳檔案內容。part 的串流只能讀一次，呼叫端若還要解析
+ *                    內容（例如 .u3m）就得在這裡拿，不能事後再讀一次。
  */
-export async function saveUpload(part, folder, allowedMime = null) {
+export async function saveUpload(part, folder, allowedMime = null, { keepBuffer = false } = {}) {
   const buffer = await part.toBuffer();
   if (buffer.length === 0) throw badRequest('上傳檔案為空');
   if (buffer.length > config.maxUploadBytes) {
@@ -26,11 +28,12 @@ export async function saveUpload(part, folder, allowedMime = null) {
   const key = buildStorageKey(folder, part.filename ?? 'file');
   await storage().put(key, buffer);
 
-  return one(
+  const row = await one(
     `insert into files (storage_key, original_name, mime_type, byte_size)
      values ($1, $2, $3, $4) returning *`,
     [key, part.filename ?? 'file', mime, buffer.length],
   );
+  return keepBuffer ? { ...row, buffer } : row;
 }
 
 export async function removeFile(fileId) {

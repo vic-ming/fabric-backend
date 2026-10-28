@@ -12,6 +12,7 @@ import { DEFAULT_RANGE } from '../routes/spec-ranges.js';
 import { DEFAULT_PATTERN_CATEGORIES } from '../routes/patterns.js';
 
 export async function seed({ log = console.log } = {}) {
+
   // --- 印花預設分類 ---
   const existingCategories = await many('select name from pattern_categories');
   const known = new Set(existingCategories.map((row) => row.name));

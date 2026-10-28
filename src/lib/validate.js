@@ -61,6 +61,14 @@ export function requireDate(value, label, { required = true } = {}) {
   return text;
 }
 
+/** 啟用／停用這類開關。只收真正的布林，避免字串 'false' 被當成真。 */
+export function requireBool(value, label) {
+  if (value === true || value === false) return value;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw badRequest(`${label} 必須為 true 或 false`);
+}
+
 export function requireOneOf(value, label, allowed) {
   if (!allowed.includes(value)) {
     throw badRequest(`${label}須為 ${allowed.join('、')} 其中之一`);

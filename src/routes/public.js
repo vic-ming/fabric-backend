@@ -29,27 +29,27 @@ export default async function publicRoutes(app) {
     const p = cid === null ? 0 : 1;
 
     const [fabricTypes, weaves, compositions, elasticities, specRange] = await Promise.all([
-      many(`select id, name from fabric_types ft
+      many(`select id, code, name from fabric_types ft
              where ${visible(ENTITY.fabricType, 'ft', cid, p)}
-             order by sort_order, name`, params),
-      many(`select w.id, w.name, w.fabric_type_id from weaves w
+             order by sort_order, code`, params),
+      many(`select w.id, w.code, w.name, w.fabric_type_id from weaves w
              where ${visible(ENTITY.weave, 'w', cid, p)}
-             order by sort_order, name`, params),
+             order by sort_order, code`, params),
       many(`select id, code, name_en, name_zh, category from compositions c
              where ${visible(ENTITY.composition, 'c', cid, p)}
              order by sort_order, code`, params),
-      many(`select id, name from elasticities e
+      many(`select id, code, name from elasticities e
              where ${visible(ENTITY.elasticity, 'e', cid, p)}
-             order by sort_order, id`, params),
+             order by sort_order, code`, params),
       resolveRangeFor(cid),
     ]);
 
     return {
       fabricTypes,
       // 前台「布樣種類會影響可選組織清單」：先分好組，前端直接依 key 取用
-      weaves: weaves.map((w) => ({ id: w.id, name: w.name, fabricTypeId: w.fabric_type_id })),
+      weaves: weaves.map((w) => ({ id: w.id, code: w.code, name: w.name, fabricTypeId: w.fabric_type_id })),
       weavesByFabricType: weaves.reduce((acc, w) => {
-        (acc[w.fabric_type_id] ??= []).push({ id: w.id, name: w.name });
+        (acc[w.fabric_type_id] ??= []).push({ id: w.id, code: w.code, name: w.name });
         return acc;
       }, {}),
       compositions: compositions.map((c) => ({
@@ -77,7 +77,7 @@ export default async function publicRoutes(app) {
          join fabric_types ft on ft.id = ws.fabric_type_id
          join weaves w on w.id = ws.weave_id
          join files pf on pf.id = ws.preview_file_id
-        where ${visible(ENTITY.weaveSpec, 'ws', cid, p)}
+        where ws.is_active and ${visible(ENTITY.weaveSpec, 'ws', cid, p)}
         order by ws.code`,
       params,
     );
@@ -156,26 +156,50 @@ export default async function publicRoutes(app) {
     };
   });
 
-  const assetList = (table, entityType, alias) => async (request) => {
-    const cid = request.user.customerId;
-    const params = cid === null ? [] : [cid];
-    const p = cid === null ? 0 : 1;
-    const rows = await many(
-      `select ${alias}.id, ${alias}.name, f.storage_key, f.original_name, f.mime_type
-         from ${table} ${alias} join files f on f.id = ${alias}.file_id
-        where ${visible(entityType, alias, cid, p)}
-        order by ${alias}.name`,
-      params,
-    );
-    return rows.map((row) => ({
-      id: row.id,
-      name: row.name,
-      url: `/api/files/${row.storage_key}`,
-      fileName: row.original_name,
-      mimeType: row.mime_type,
-    }));
-  };
+  /**
+   * @param hasSize   3D 模型帶公分尺寸，前台用它算貼圖重複次數
+   * @param hasActive 停用的項目不出現在前台（後台仍看得到）
+   */
+  const assetList = (table, entityType, alias, { hasSize = false, hasActive = false } = {}) =>
+    async (request) => {
+      const cid = request.user.customerId;
+      const params = cid === null ? [] : [cid];
+      const p = cid === null ? 0 : 1;
+      const sizeCols = hasSize ? `, ${alias}.size_width_cm, ${alias}.size_height_cm` : '';
+      const activeFilter = hasActive ? `${alias}.is_active and ` : '';
+      const rows = await many(
+        `select ${alias}.id, ${alias}.code, ${alias}.name${sizeCols},
+                f.storage_key, f.original_name, f.mime_type
+           from ${table} ${alias} join files f on f.id = ${alias}.file_id
+          where ${activeFilter}${visible(entityType, alias, cid, p)}
+          order by ${alias}.code`,
+        params,
+      );
+      return rows.map((row) => ({
+        id: row.id,
+        code: row.code,
+        name: row.name,
+        url: `/api/files/${row.storage_key}`,
+        fileName: row.original_name,
+        mimeType: row.mime_type,
+        ...(hasSize ? {
+          sizeWidthCm: row.size_width_cm === null ? null : Number(row.size_width_cm),
+          sizeHeightCm: row.size_height_cm === null ? null : Number(row.size_height_cm),
+        } : {}),
+      }));
+    };
 
-  app.get('/api/backgrounds', assetList('backgrounds', ENTITY.background, 'b'));
-  app.get('/api/models-3d', assetList('models_3d', ENTITY.model3d, 'm'));
+  app.get('/api/backgrounds', assetList('backgrounds', ENTITY.background, 'b', { hasActive: true }));
+  app.get('/api/models-3d', assetList('models_3d', ENTITY.model3d, 'm', { hasSize: true, hasActive: true }));
+
+  /**
+   * 前台「素色」底圖的色號清單。色票不分客戶，全部可用。
+   * 不同系列會有相同色號，前台要以「系列＋色號」辨識，所以一併回傳 colorType。
+   */
+  app.get('/api/pantone', async () => {
+    const rows = await many(
+      'select code, name, color_type, hex from pantone_colors order by sort_order, code',
+    );
+    return rows.map((row) => ({ code: row.code, name: row.name, colorType: row.color_type, hex: row.hex }));
+  });
 }

@@ -1,7 +1,11 @@
 // 規格書 6-(3) 選項參數管理 — 四個頁籤：布樣種類 / 組織 / 成分 / 彈性
 //
 // 四者共通：
-//   ・名稱（或編號）不得重複，且編輯時不可修改
+//   ・適用對象：全域 或 指定客戶（至少一位）
+// 布樣種類與組織改以「編號」為識別鍵：
+//   ・編號建立後不可變更，且「同公司不可重複、跨公司可重複」
+//     （不同公司會各自有同名的布樣種類／組織，見 scope.js 的 assertScopedCodeUnique）
+//   ・名稱純顯示用，可重複、可修改
 //   ・適用對象：全域 或 指定客戶（至少一位）
 // 差異：
 //   ・組織 多一個「對應布樣」，前台依此篩選可選組織清單
@@ -9,8 +13,9 @@
 
 import { many, one, query, tx } from '../db/index.js';
 import { requireAdmin } from '../lib/auth.js';
+import { registerBatchDelete } from '../lib/batch-delete.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
-import { ENTITY, assertCustomersExist, attachScope, clearScope, parseScope, writeScope } from '../lib/scope.js';
+import { ENTITY, assertCustomersExist, assertScopedCodeUnique, attachScope, clearScope, parseScope, writeScope } from '../lib/scope.js';
 import { requireInt, requireText } from '../lib/validate.js';
 
 const scopeView = (row) => ({
@@ -31,51 +36,59 @@ export default async function optionRoutes(app) {
   // ------------------------------------------------------------ 布樣種類
 
   app.get('/api/admin/fabric-types', async () => {
-    const rows = await many('select * from fabric_types order by sort_order, name');
+    const rows = await many('select * from fabric_types order by sort_order, code');
     await attachScope(ENTITY.fabricType, rows);
-    return rows.map((row) => ({ id: row.id, name: row.name, ...scopeView(row) }));
+    return rows.map((row) => ({ id: row.id, code: row.code, name: row.name, ...scopeView(row) }));
   });
 
   app.post('/api/admin/fabric-types', async (request, reply) => {
+    const code = requireText(request.body?.code, '編號', 50);
     const name = requireText(request.body?.name, '名稱', 50);
     const scope = parseScope(request.body);
-    await assertUnique('fabric_types', 'name', name, '布樣種類名稱');
     await assertCustomersExist(scope.customerIds);
+    await assertScopedCodeUnique({
+      table: 'fabric_types', entityType: ENTITY.fabricType, code, scope, label: '布樣種類編號',
+    });
 
     const row = await tx(async (dbx) => {
       const created = await dbx.query(
-        'insert into fabric_types (name, scope_type) values ($1, $2) returning *',
-        [name, scope.scopeType],
+        'insert into fabric_types (code, name, scope_type) values ($1, $2, $3) returning *',
+        [code, name, scope.scopeType],
       ).then((r) => r.rows[0]);
       await writeScope(dbx, ENTITY.fabricType, created.id, scope);
       return created;
     });
     await attachScope(ENTITY.fabricType, [row]);
     reply.code(201);
-    return { id: row.id, name: row.name, ...scopeView(row) };
+    return { id: row.id, code: row.code, name: row.name, ...scopeView(row) };
   });
 
   app.put('/api/admin/fabric-types/:id', async (request) => {
     const current = await one('select * from fabric_types where id = $1', [request.params.id]);
     if (!current) throw notFound('布樣種類不存在');
+    const name = requireText(request.body?.name, '名稱', 50);
     const scope = parseScope(request.body);
     await assertCustomersExist(scope.customerIds);
+    // 適用對象改了，編號的可見範圍跟著變，要重新檢查有沒有撞號
+    await assertScopedCodeUnique({
+      table: 'fabric_types', entityType: ENTITY.fabricType, code: current.code,
+      scope, excludeId: current.id, label: '布樣種類編號',
+    });
 
-    // 編輯時不得修改名稱
+    // 編輯時不得修改編號，名稱可改
     const row = await tx(async (dbx) => {
       const updated = await dbx.query(
-        'update fabric_types set scope_type = $2, updated_at = now() where id = $1 returning *',
-        [current.id, scope.scopeType],
+        'update fabric_types set name = $2, scope_type = $3, updated_at = now() where id = $1 returning *',
+        [current.id, name, scope.scopeType],
       ).then((r) => r.rows[0]);
       await writeScope(dbx, ENTITY.fabricType, current.id, scope);
       return updated;
     });
     await attachScope(ENTITY.fabricType, [row]);
-    return { id: row.id, name: row.name, ...scopeView(row) };
+    return { id: row.id, code: row.code, name: row.name, ...scopeView(row) };
   });
 
-  app.delete('/api/admin/fabric-types/:id', async (request, reply) => {
-    const id = Number(request.params.id);
+  async function deleteFabricType(id) {
     const current = await one('select * from fabric_types where id = $1', [id]);
     if (!current) throw notFound('布樣種類不存在');
 
@@ -89,8 +102,14 @@ export default async function optionRoutes(app) {
       await clearScope(dbx, ENTITY.fabricType, id);
       await dbx.query('delete from fabric_types where id = $1', [id]);
     });
+  }
+
+  app.delete('/api/admin/fabric-types/:id', async (request, reply) => {
+    await deleteFabricType(Number(request.params.id));
     reply.code(204);
   });
+
+  registerBatchDelete(app, '/api/admin/fabric-types', deleteFabricType);
 
   // ------------------------------------------------------------ 組織
 
@@ -101,12 +120,13 @@ export default async function optionRoutes(app) {
          from weaves w
          join fabric_types ft on ft.id = w.fabric_type_id
         ${fabricTypeId ? 'where w.fabric_type_id = $1' : ''}
-        order by ft.sort_order, ft.name, w.sort_order, w.name`,
+        order by ft.sort_order, ft.code, w.sort_order, w.code`,
       fabricTypeId ? [Number(fabricTypeId)] : [],
     );
     await attachScope(ENTITY.weave, rows);
     return rows.map((row) => ({
       id: row.id,
+      code: row.code,
       name: row.name,
       fabricTypeId: row.fabric_type_id,
       fabricTypeName: row.fabric_type_name,
@@ -115,19 +135,22 @@ export default async function optionRoutes(app) {
   });
 
   app.post('/api/admin/weaves', async (request, reply) => {
+    const code = requireText(request.body?.code, '編號', 50);
     const name = requireText(request.body?.name, '名稱', 50);
     const fabricTypeId = requireInt(request.body?.fabricTypeId, '對應布樣');
     const scope = parseScope(request.body);
-    await assertUnique('weaves', 'name', name, '組織名稱');
     if (!(await one('select id from fabric_types where id = $1', [fabricTypeId]))) {
       throw badRequest('對應布樣不存在');
     }
     await assertCustomersExist(scope.customerIds);
+    await assertScopedCodeUnique({
+      table: 'weaves', entityType: ENTITY.weave, code, scope, label: '組織編號',
+    });
 
     const created = await tx(async (dbx) => {
       const row = await dbx.query(
-        'insert into weaves (name, fabric_type_id, scope_type) values ($1, $2, $3) returning id',
-        [name, fabricTypeId, scope.scopeType],
+        'insert into weaves (code, name, fabric_type_id, scope_type) values ($1, $2, $3, $4) returning id',
+        [code, name, fabricTypeId, scope.scopeType],
       ).then((r) => r.rows[0]);
       await writeScope(dbx, ENTITY.weave, row.id, scope);
       return row;
@@ -139,26 +162,30 @@ export default async function optionRoutes(app) {
   app.put('/api/admin/weaves/:id', async (request) => {
     const current = await one('select * from weaves where id = $1', [request.params.id]);
     if (!current) throw notFound('組織不存在');
+    const name = requireText(request.body?.name, '名稱', 50);
     const fabricTypeId = requireInt(request.body?.fabricTypeId, '對應布樣');
     const scope = parseScope(request.body);
     if (!(await one('select id from fabric_types where id = $1', [fabricTypeId]))) {
       throw badRequest('對應布樣不存在');
     }
     await assertCustomersExist(scope.customerIds);
+    await assertScopedCodeUnique({
+      table: 'weaves', entityType: ENTITY.weave, code: current.code,
+      scope, excludeId: current.id, label: '組織編號',
+    });
 
-    // 編輯時不得修改名稱
+    // 編輯時不得修改編號，名稱可改
     await tx(async (dbx) => {
       await dbx.query(
-        'update weaves set fabric_type_id = $2, scope_type = $3, updated_at = now() where id = $1',
-        [current.id, fabricTypeId, scope.scopeType],
+        'update weaves set name = $2, fabric_type_id = $3, scope_type = $4, updated_at = now() where id = $1',
+        [current.id, name, fabricTypeId, scope.scopeType],
       );
       await writeScope(dbx, ENTITY.weave, current.id, scope);
     });
     return loadWeave(current.id);
   });
 
-  app.delete('/api/admin/weaves/:id', async (request, reply) => {
-    const id = Number(request.params.id);
+  async function deleteWeave(id) {
     const current = await one('select * from weaves where id = $1', [id]);
     if (!current) throw notFound('組織不存在');
 
@@ -169,8 +196,14 @@ export default async function optionRoutes(app) {
       await clearScope(dbx, ENTITY.weave, id);
       await dbx.query('delete from weaves where id = $1', [id]);
     });
+  }
+
+  app.delete('/api/admin/weaves/:id', async (request, reply) => {
+    await deleteWeave(Number(request.params.id));
     reply.code(204);
   });
+
+  registerBatchDelete(app, '/api/admin/weaves', deleteWeave);
 
   async function loadWeave(id) {
     const row = await one(
@@ -182,6 +215,7 @@ export default async function optionRoutes(app) {
     await attachScope(ENTITY.weave, [row]);
     return {
       id: row.id,
+      code: row.code,
       name: row.name,
       fabricTypeId: row.fabric_type_id,
       fabricTypeName: row.fabric_type_name,
@@ -232,19 +266,21 @@ export default async function optionRoutes(app) {
   app.put('/api/admin/compositions/:id', async (request) => {
     const current = await one('select * from compositions where id = $1', [request.params.id]);
     if (!current) throw notFound('成分不存在');
+    const code = requireText(request.body?.code, '編號', 50);
     const nameEn = requireText(request.body?.nameEn, '英文名稱', 50);
     const nameZh = requireText(request.body?.nameZh, '中文名稱', 50);
     const category = requireText(request.body?.category, '分類', 50, { required: false });
     const scope = parseScope(request.body);
     await assertCustomersExist(scope.customerIds);
+    // 編號改為可修改，但仍不得與其他成分重複
+    await assertUnique('compositions', 'code', code, '成分編號', current.id);
 
-    // 編輯時不得修改編號
     const row = await tx(async (dbx) => {
       const updated = await dbx.query(
-        `update compositions set name_en = $2, name_zh = $3, category = $4,
-                scope_type = $5, updated_at = now()
+        `update compositions set code = $2, name_en = $3, name_zh = $4, category = $5,
+                scope_type = $6, updated_at = now()
           where id = $1 returning *`,
-        [current.id, nameEn, nameZh, category, scope.scopeType],
+        [current.id, code, nameEn, nameZh, category, scope.scopeType],
       ).then((r) => r.rows[0]);
       await writeScope(dbx, ENTITY.composition, current.id, scope);
       return updated;
@@ -253,8 +289,7 @@ export default async function optionRoutes(app) {
     return compositionView(row);
   });
 
-  app.delete('/api/admin/compositions/:id', async (request, reply) => {
-    const id = Number(request.params.id);
+  async function deleteComposition(id) {
     const current = await one('select * from compositions where id = $1', [id]);
     if (!current) throw notFound('成分不存在');
 
@@ -267,62 +302,81 @@ export default async function optionRoutes(app) {
       await clearScope(dbx, ENTITY.composition, id);
       await dbx.query('delete from compositions where id = $1', [id]);
     });
+  }
+
+  app.delete('/api/admin/compositions/:id', async (request, reply) => {
+    await deleteComposition(Number(request.params.id));
     reply.code(204);
   });
+
+  registerBatchDelete(app, '/api/admin/compositions', deleteComposition);
 
   // ------------------------------------------------------------ 彈性
 
   app.get('/api/admin/elasticities', async () => {
-    const rows = await many('select * from elasticities order by sort_order, id');
+    const rows = await many('select * from elasticities order by sort_order, code');
     await attachScope(ENTITY.elasticity, rows);
-    return rows.map((row) => ({ id: row.id, name: row.name, ...scopeView(row) }));
+    return rows.map((row) => ({ id: row.id, code: row.code, name: row.name, ...scopeView(row) }));
   });
 
   app.post('/api/admin/elasticities', async (request, reply) => {
+    const code = requireText(request.body?.code, '編號', 50);
     const name = requireText(request.body?.name, '名稱', 50);
     const scope = parseScope(request.body);
-    await assertUnique('elasticities', 'name', name, '彈性名稱');
     await assertCustomersExist(scope.customerIds);
+    await assertScopedCodeUnique({
+      table: 'elasticities', entityType: ENTITY.elasticity, code, scope, label: '彈性編號',
+    });
 
     const row = await tx(async (dbx) => {
       const created = await dbx.query(
-        'insert into elasticities (name, scope_type) values ($1, $2) returning *',
-        [name, scope.scopeType],
+        'insert into elasticities (code, name, scope_type) values ($1, $2, $3) returning *',
+        [code, name, scope.scopeType],
       ).then((r) => r.rows[0]);
       await writeScope(dbx, ENTITY.elasticity, created.id, scope);
       return created;
     });
     await attachScope(ENTITY.elasticity, [row]);
     reply.code(201);
-    return { id: row.id, name: row.name, ...scopeView(row) };
+    return { id: row.id, code: row.code, name: row.name, ...scopeView(row) };
   });
 
   app.put('/api/admin/elasticities/:id', async (request) => {
     const current = await one('select * from elasticities where id = $1', [request.params.id]);
     if (!current) throw notFound('彈性不存在');
+    const name = requireText(request.body?.name, '名稱', 50);
     const scope = parseScope(request.body);
     await assertCustomersExist(scope.customerIds);
+    await assertScopedCodeUnique({
+      table: 'elasticities', entityType: ENTITY.elasticity, code: current.code,
+      scope, excludeId: current.id, label: '彈性編號',
+    });
 
-    // 編輯時不得修改名稱
+    // 編輯時不得修改編號，名稱可改
     const row = await tx(async (dbx) => {
       const updated = await dbx.query(
-        'update elasticities set scope_type = $2, updated_at = now() where id = $1 returning *',
-        [current.id, scope.scopeType],
+        'update elasticities set name = $2, scope_type = $3, updated_at = now() where id = $1 returning *',
+        [current.id, name, scope.scopeType],
       ).then((r) => r.rows[0]);
       await writeScope(dbx, ENTITY.elasticity, current.id, scope);
       return updated;
     });
     await attachScope(ENTITY.elasticity, [row]);
-    return { id: row.id, name: row.name, ...scopeView(row) };
+    return { id: row.id, code: row.code, name: row.name, ...scopeView(row) };
   });
 
-  app.delete('/api/admin/elasticities/:id', async (request, reply) => {
-    const id = Number(request.params.id);
+  async function deleteElasticity(id) {
     if (!(await one('select id from elasticities where id = $1', [id]))) throw notFound('彈性不存在');
     await tx(async (dbx) => {
       await clearScope(dbx, ENTITY.elasticity, id);
       await dbx.query('delete from elasticities where id = $1', [id]);
     });
+  }
+
+  app.delete('/api/admin/elasticities/:id', async (request, reply) => {
+    await deleteElasticity(Number(request.params.id));
     reply.code(204);
   });
+
+  registerBatchDelete(app, '/api/admin/elasticities', deleteElasticity);
 }

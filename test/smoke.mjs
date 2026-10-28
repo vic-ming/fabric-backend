@@ -103,7 +103,17 @@ let customerB;
     name: '小易股份有限公司（改）', taxId: '87654321', contactName: '陳曉華',
   });
   ok('編輯客戶成功', edited.status === 200, JSON.stringify(edited.body));
-  ok('統一編號不可修改', edited.body?.taxId === '12345678', edited.body?.taxId);
+  ok('統一編號可修改', edited.body?.taxId === '87654321', edited.body?.taxId);
+
+  const taxClash = await call('PUT', `/api/admin/customers/${customerA}`, {
+    name: '小易股份有限公司（改）', taxId: '23456789',
+  });
+  ok('統編改成別家公司的被擋 409', taxClash.status === 409, JSON.stringify(taxClash.body));
+
+  const off = await call('PUT', `/api/admin/customers/${customerA}/active`, { isActive: false });
+  ok('公司可停用', off.status === 200 && off.body?.isActive === false, JSON.stringify(off.body));
+  const on = await call('PUT', `/api/admin/customers/${customerA}/active`, { isActive: true });
+  ok('公司可重新啟用', on.body?.isActive === true, JSON.stringify(on.body));
 
   const list = await call('GET', '/api/admin/customers?keyword=安欣');
   ok('關鍵字搜尋', list.body?.items?.length === 1 && list.body.items[0].name.includes('安欣'), JSON.stringify(list.body));
@@ -171,27 +181,49 @@ let weaveId;
 let compositionCO;
 let compositionPES;
 {
-  const wo = await call('POST', '/api/admin/fabric-types', { name: '梭織', scopeType: 'global' });
+  const wo = await call('POST', '/api/admin/fabric-types', { code: 'WO', name: '梭織', scopeType: 'global' });
   ok('新增布樣種類（全域）', wo.status === 201, JSON.stringify(wo.body));
   fabricTypeWO = wo.body.id;
 
   const cw = await call('POST', '/api/admin/fabric-types', {
-    name: '特殊緹花', scopeType: 'customers', customerIds: [customerA, customerB],
+    code: 'SP', name: '特殊緹花', scopeType: 'customers', customerIds: [customerA, customerB],
   });
   ok('新增布樣種類（指定客戶）', cw.status === 201 && cw.body.customers.length === 2, JSON.stringify(cw.body));
   fabricTypeCW = cw.body.id;
 
-  const noPick = await call('POST', '/api/admin/fabric-types', { name: '圓編', scopeType: 'customers', customerIds: [] });
+  const noPick = await call('POST', '/api/admin/fabric-types', { code: 'CW', name: '圓編', scopeType: 'customers', customerIds: [] });
   ok('指定客戶但未選任何客戶被擋', noPick.status === 400, JSON.stringify(noPick.body));
 
-  const dup = await call('POST', '/api/admin/fabric-types', { name: '梭織' });
-  ok('布樣種類名稱重複被擋', dup.status === 409, JSON.stringify(dup.body));
+  const sameName = await call('POST', '/api/admin/fabric-types', { code: 'WO2', name: '梭織', scopeType: 'global' });
+  ok('名稱可重複', sameName.status === 201, JSON.stringify(sameName.body));
+
+  const dup = await call('POST', '/api/admin/fabric-types', { code: 'WO', name: '別的名字' });
+  ok('全域編碼重複被擋', dup.status === 409, JSON.stringify(dup.body));
+
+  // 編碼「同公司不可重複、跨公司可重複」
+  const onlyA = await call('POST', '/api/admin/fabric-types', {
+    code: 'LOCAL', name: '甲公司專用', scopeType: 'customers', customerIds: [customerA],
+  });
+  ok('指定甲公司可建編碼 LOCAL', onlyA.status === 201, JSON.stringify(onlyA.body));
+  const alsoA = await call('POST', '/api/admin/fabric-types', {
+    code: 'LOCAL', name: '撞號', scopeType: 'customers', customerIds: [customerA],
+  });
+  ok('同一家公司不得重複編碼', alsoA.status === 409, JSON.stringify(alsoA.body));
+  const onlyB = await call('POST', '/api/admin/fabric-types', {
+    code: 'LOCAL', name: '乙公司專用', scopeType: 'customers', customerIds: [customerB],
+  });
+  ok('跨公司可用同一編碼', onlyB.status === 201, JSON.stringify(onlyB.body));
+  const globalClash = await call('POST', '/api/admin/fabric-types', {
+    code: 'LOCAL', name: '全域撞號', scopeType: 'global',
+  });
+  ok('全域編碼與任一公司撞號即被擋', globalClash.status === 409, JSON.stringify(globalClash.body));
 
   const renamed = await call('PUT', `/api/admin/fabric-types/${fabricTypeWO}`, { name: '改名', scopeType: 'global' });
-  ok('編輯時名稱不可修改', renamed.body?.name === '梭織', renamed.body?.name);
+  ok('名稱可修改', renamed.body?.name === '改名', renamed.body?.name);
+  ok('編碼不隨編輯改變', renamed.body?.code === 'WO', renamed.body?.code);
 
   const weave = await call('POST', '/api/admin/weaves', {
-    name: '平紋', fabricTypeId: fabricTypeWO, scopeType: 'global',
+    code: 'PLAIN', name: '平紋', fabricTypeId: fabricTypeWO, scopeType: 'global',
   });
   ok('新增組織', weave.status === 201, JSON.stringify(weave.body));
   weaveId = weave.body.id;
@@ -219,14 +251,26 @@ let compositionPES;
   const codeEdit = await call('PUT', `/api/admin/compositions/${compositionCO}`, {
     code: 'ZZ', nameEn: 'Cotton', nameZh: '棉花', scopeType: 'global',
   });
-  ok('編輯時編號不可修改', codeEdit.body?.code === 'CO', codeEdit.body?.code);
+  ok('成分編號可修改', codeEdit.body?.code === 'ZZ', codeEdit.body?.code);
+  const codeEditClash = await call('PUT', `/api/admin/compositions/${compositionCO}`, {
+    code: 'PES', nameEn: 'Cotton', nameZh: '棉花', scopeType: 'global',
+  });
+  ok('改成別筆已用的編號被擋', codeEditClash.status === 409, JSON.stringify(codeEditClash.body));
   ok('中文名稱可修改', codeEdit.body?.nameZh === '棉花');
 
-  for (const name of ['無彈性', '經向彈性', '緯向彈性', '四向彈性']) {
-    await call('POST', '/api/admin/elasticities', { name, scopeType: 'global' });
+  for (const [i, name] of ['無彈性', '經向彈性', '緯向彈性', '四向彈性'].entries()) {
+    await call('POST', '/api/admin/elasticities', { code: `EL${i}`, name, scopeType: 'global' });
   }
+  const elDupName = await call('POST', '/api/admin/elasticities', {
+    code: 'EL9', name: '無彈性', scopeType: 'global',
+  });
+  ok('彈性名稱可重複', elDupName.status === 201, JSON.stringify(elDupName.body));
+  const elDupCode = await call('POST', '/api/admin/elasticities', {
+    code: 'EL0', name: '撞編碼', scopeType: 'global',
+  });
+  ok('彈性編碼重複被擋', elDupCode.status === 409, JSON.stringify(elDupCode.body));
   const elasticities = await call('GET', '/api/admin/elasticities');
-  ok('新增四種彈性', elasticities.body?.length === 4, JSON.stringify(elasticities.body?.map((e) => e.name)));
+  ok('新增四種彈性', elasticities.body?.length === 5, JSON.stringify(elasticities.body?.map((e) => e.name)));
 
   void fabricTypeCW;
 }
@@ -280,16 +324,30 @@ let patternId;
       [{ field: 'files', data: png, type: 'image/png', name: 'camo_green_01.png' }]),
     { multipart: true });
   ok('上傳一般分類印花', uploaded.status === 201, JSON.stringify(uploaded.body));
-  ok('未填名稱時以檔名為預設', uploaded.body?.[0]?.name === 'camo_green_01.png', uploaded.body?.[0]?.name);
-  ok('公分尺寸有存下', uploaded.body?.[0]?.physicalWidthCm === 9.144);
-  patternId = uploaded.body[0].id;
+  ok('未填名稱時以檔名為預設', uploaded.body?.name === 'camo_green_01.png', uploaded.body?.name);
+  ok('設計尺寸有存下', uploaded.body?.physicalWidthCm === 9.144);
+  patternId = uploaded.body.id;
 
+  // 每張印花都要有自己的設計尺寸，多檔上傳無法逐張指定，因此改為一次一張
   const multi = await call('POST', '/api/admin/patterns',
     form({ kind: 'customer', customerId: customerB },
       [{ field: 'files', data: png, type: 'image/png', name: 'a.png' },
        { field: 'files', data: png, type: 'image/png', name: 'b.png' }]),
     { multipart: true });
-  ok('客戶圖庫可一次多檔', multi.status === 201 && multi.body.length === 2, JSON.stringify(multi.body));
+  ok('一次只能上傳一張', multi.status === 400, JSON.stringify(multi.body));
+
+  const single = await call('POST', '/api/admin/patterns',
+    form({ kind: 'customer', customerId: customerB },
+      [{ field: 'files', data: png, type: 'image/png', name: 'a.png' }]),
+    { multipart: true });
+  ok('客戶圖庫單張上傳成功', single.status === 201, JSON.stringify(single.body));
+
+  const catAdded = await call('POST', '/api/admin/pattern-categories', { name: '手繪風' });
+  ok('可新增印花分類', catAdded.status === 201, JSON.stringify(catAdded.body));
+  const catRenamed = await call('PUT', `/api/admin/pattern-categories/${catAdded.body.id}`, { name: '手繪' });
+  ok('可編輯印花分類', catRenamed.body?.name === '手繪', JSON.stringify(catRenamed.body));
+  const catRemoved = await call('DELETE', `/api/admin/pattern-categories/${catAdded.body.id}`);
+  ok('可刪除空的印花分類', catRemoved.status === 204, catRemoved.status);
 
   const noTarget = await call('POST', '/api/admin/patterns',
     form({ kind: 'general' }, [{ field: 'files', data: png, type: 'image/png', name: 'x.png' }]),
@@ -311,15 +369,27 @@ let patternId;
   ok('分類底下有圖片時不得刪除', catDel.status === 400, JSON.stringify(catDel.body));
 
   const byCustomer = await call('GET', `/api/admin/patterns?kind=customer&customerId=${customerB}`);
-  ok('可依客戶篩選圖庫', byCustomer.body?.total === 2, JSON.stringify(byCustomer.body?.total));
+  ok('可依客戶篩選圖庫', byCustomer.body?.total === 1, JSON.stringify(byCustomer.body?.total));
 
-  const fileUrl = uploaded.body[0].file.url;
+  const fileUrl = uploaded.body.file.url;
   const served = await fetch(`${base}${fileUrl}`);
   ok('檔案可正常讀取', served.status === 200 && served.headers.get('content-type') === 'image/png',
     `${served.status} ${served.headers.get('content-type')}`);
 }
 
 // ---------------------------------------------------------------- 組織規格
+
+
+// 最小但結構正確的 .u3m：兩個材質通道，basecolor 記著實際尺寸（公釐）
+const u3mDoc = (name, widthMm, heightMm) => Buffer.from(JSON.stringify({
+  material: {
+    front: {
+      basecolor: { texture: { image: { path: `textures/${name}_BASE.jpg`, width: widthMm, height: heightMm } } },
+      normal: { texture: { image: { path: `textures/${name}_NRM.jpg`, width: widthMm, height: heightMm } } },
+      preview: { path: `${name}.png`, width: 100, height: 100 },
+    },
+  },
+}));
 
 section('組織規格管理');
 let weaveSpecId;
@@ -334,12 +404,45 @@ let weaveSpecId;
       ]),
     }, [
       { field: 'preview', data: png, type: 'image/png', name: 'preview.png' },
-      { field: 'files', data: Buffer.from('u3m content'), type: 'application/octet-stream', name: 'F-0001.u3m' },
+      { field: 'files', data: u3mDoc('F-0001', 39.649, 40.339), type: 'application/octet-stream', name: 'F-0001.u3m' },
+      { field: 'files', data: png, type: 'image/jpeg', name: 'F-0001_BASE.jpg' },
+      { field: 'files', data: png, type: 'image/jpeg', name: 'F-0001_NRM.jpg' },
     ]),
     { multipart: true });
   ok('新增組織規格', created.status === 201, JSON.stringify(created.body));
   ok('成分有兩項', created.body?.compositions?.length === 2);
-  ok('組織資料檔案有一個', created.body?.files?.length === 1);
+  ok('組織資料檔案有三個', created.body?.files?.length === 3);
+  // 沒填尺寸時，自動以 .u3m 記錄的公釐換算成公分帶入
+  ok('u3m 尺寸自動帶入（39.649mm → 3.965cm）',
+    created.body?.designWidthCm === 3.965 && created.body?.designHeightCm === 4.034,
+    JSON.stringify([created.body?.designWidthCm, created.body?.designHeightCm]));
+
+  const missingTex = await call('POST', '/api/admin/weave-specs',
+    form({
+      code: 'F-0009', fabricTypeId: fabricTypeWO, weaveId, weight: 100, thickness: 1,
+      scopeType: 'global',
+      compositions: JSON.stringify([{ compositionId: compositionPES, percent: 100 }]),
+    }, [
+      { field: 'preview', data: png, type: 'image/png', name: 'preview.png' },
+      { field: 'files', data: u3mDoc('F-0009', 30, 30), type: 'application/octet-stream', name: 'F-0009.u3m' },
+      { field: 'files', data: png, type: 'image/jpeg', name: 'F-0009_BASE.jpg' },
+    ]),
+    { multipart: true });
+  ok('u3m 缺貼圖被擋並列出檔名',
+    missingTex.status === 400 && String(missingTex.body?.error).includes('F-0009_NRM.jpg'),
+    JSON.stringify(missingTex.body));
+
+  const badU3m = await call('POST', '/api/admin/weave-specs',
+    form({
+      code: 'F-0008', fabricTypeId: fabricTypeWO, weaveId, weight: 100, thickness: 1,
+      scopeType: 'global',
+      compositions: JSON.stringify([{ compositionId: compositionPES, percent: 100 }]),
+    }, [
+      { field: 'preview', data: png, type: 'image/png', name: 'preview.png' },
+      { field: 'files', data: Buffer.from('not json'), type: 'application/octet-stream', name: 'F-0008.u3m' },
+    ]),
+    { multipart: true });
+  ok('壞掉的 u3m 被擋', badU3m.status === 400, JSON.stringify(badU3m.body));
   weaveSpecId = created.body.id;
 
   const badSum = await call('POST', '/api/admin/weave-specs',
@@ -386,7 +489,7 @@ let weaveSpecId;
   ok('編輯時編號不可修改', edited.body?.code === 'F-0001', edited.body?.code);
   ok('布重已更新', edited.body?.weight === 210);
   ok('成分已替換為一項', edited.body?.compositions?.length === 1);
-  ok('保留舊檔並新增一個', edited.body?.files?.length === 2, JSON.stringify(edited.body?.files?.map((f) => f.name)));
+  ok('保留舊檔並新增一個', edited.body?.files?.length === 4, JSON.stringify(edited.body?.files?.map((f) => f.name)));
   ok('適用對象改為指定客戶', edited.body?.scopeType === 'customers' && edited.body.customers.length === 1);
 
   const usedWeave = await call('DELETE', `/api/admin/weaves/${weaveId}`);
@@ -399,27 +502,44 @@ let weaveSpecId;
 // ---------------------------------------------------------------- 背景 / 3D 模型
 
 section('背景管理 / 3D 模型管理');
+let modelAId;
 {
   const bg = await call('POST', '/api/admin/backgrounds',
-    form({ name: '純白攝影棚', scopeType: 'global' },
+    form({ code: 'BG-WHITE', name: '純白攝影棚', scopeType: 'global' },
       [{ field: 'file', data: Buffer.from('hdr'), type: 'application/octet-stream', name: 'studio.hdr' }]),
     { multipart: true });
   ok('上傳背景', bg.status === 201, JSON.stringify(bg.body));
 
+  const bgBadExt = await call('POST', '/api/admin/backgrounds',
+    form({ code: 'BG-PNG', name: '非 hdr', scopeType: 'global' },
+      [{ field: 'file', data: Buffer.from('png'), type: 'image/png', name: 'studio.png' }]),
+    { multipart: true });
+  ok('背景只收 .hdr', bgBadExt.status === 400, JSON.stringify(bgBadExt.body));
+
   const bgDup = await call('POST', '/api/admin/backgrounds',
-    form({ name: '純白攝影棚', scopeType: 'global' },
+    form({ code: 'BG-WHITE', name: '不同名字', scopeType: 'global' },
       [{ field: 'file', data: Buffer.from('hdr'), type: 'application/octet-stream', name: 'x.hdr' }]),
     { multipart: true });
-  ok('背景名稱不得重複', bgDup.status === 409, JSON.stringify(bgDup.body));
+  ok('背景編碼不得重複', bgDup.status === 409, JSON.stringify(bgDup.body));
 
   const model = await call('POST', '/api/admin/models-3d',
-    form({ name: '球體', scopeType: 'customers', customerIds: JSON.stringify([customerA]) },
+    form({ code: 'M-BALL', name: '球體', sizeWidthCm: 50, sizeHeightCm: 50.5,
+           scopeType: 'customers', customerIds: JSON.stringify([customerA]) },
       [{ field: 'file', data: Buffer.from('obj'), type: 'application/octet-stream', name: 'sphere.obj' }]),
     { multipart: true });
   ok('上傳 3D 模型（指定客戶）', model.status === 201 && model.body.customers.length === 1, JSON.stringify(model.body));
+  modelAId = model.body.id;
+  ok('模型尺寸可含小數', model.body?.sizeHeightCm === 50.5, JSON.stringify(model.body?.sizeHeightCm));
+
+  // A 公司與 B 公司可以各有一個叫「衣服」的模型
+  const sameNameB = await call('POST', '/api/admin/models-3d',
+    form({ code: 'M-BALL', name: '球體', scopeType: 'customers', customerIds: JSON.stringify([customerB]) },
+      [{ field: 'file', data: Buffer.from('obj'), type: 'application/octet-stream', name: 'sphere2.obj' }]),
+    { multipart: true });
+  ok('模型名稱與編碼可跨公司重複', sameNameB.status === 201, JSON.stringify(sameNameB.body));
 
   const tshirt = await call('POST', '/api/admin/models-3d',
-    form({ name: 'T恤', scopeType: 'global' },
+    form({ code: 'M-TSHIRT', name: 'T恤', scopeType: 'global' },
       [{ field: 'file', data: Buffer.from('obj'), type: 'application/octet-stream', name: 'tshirt.obj' }]),
     { multipart: true });
   ok('上傳全域 3D 模型', tshirt.status === 201);
@@ -431,6 +551,53 @@ section('背景管理 / 3D 模型管理');
     name: '戶外草地', scopeType: 'global',
   });
   ok('可只改名稱不重傳檔案', renamed.body?.name === '戶外草地', JSON.stringify(renamed.body));
+
+  const off = await call('PUT', `/api/admin/models-3d/${tshirt.body.id}/active`, { isActive: false });
+  ok('模型可停用', off.status === 200 && off.body?.isActive === false, JSON.stringify(off.body));
+  const backOn = await call('PUT', `/api/admin/models-3d/${tshirt.body.id}/active`, { isActive: true });
+  ok('模型可重新啟用', backOn.body?.isActive === true, JSON.stringify(backOn.body));
+}
+
+// ---------------------------------------------------------------- Pantone
+
+section('Pantone 色票管理');
+{
+  const color = { code: 'TEST-01', name: '測試色', colorType: 'TPX', r: 170, g: 187, b: 204, c: 12.5, labL: 75.123 };
+  const added = await call('POST', '/api/admin/pantone', color);
+  ok('可新增色票，hex 由 RGB 換算', added.status === 201 && added.body?.hex === '#aabbcc'
+    && added.body?.c === 12.5 && added.body?.labL === 75.123, JSON.stringify(added.body));
+
+  const search = await call('GET', '/api/admin/pantone?keyword=TEST-01');
+  ok('可依色號搜尋', search.body?.items?.[0]?.id === added.body?.id, JSON.stringify(search.body?.items?.[0]));
+
+  const badRgb = await call('POST', '/api/admin/pantone', { code: 'TEST-02', r: 256, g: 0, b: 0 });
+  ok('RGB 超出範圍被擋', badRgb.status === 400, JSON.stringify(badRgb.body));
+
+  const dupCode = await call('POST', '/api/admin/pantone', { code: 'TEST-01', colorType: 'TPX', r: 0, g: 0, b: 0 });
+  ok('同系列色號重複被擋', dupCode.status === 409, JSON.stringify(dupCode.body));
+
+  // 10/22：不同系列會有相同色號
+  const otherSeries = await call('POST', '/api/admin/pantone', { code: 'TEST-01', colorType: 'TPG', r: 0, g: 0, b: 0 });
+  ok('不同系列可有相同色號', otherSeries.status === 201, JSON.stringify(otherSeries.body));
+
+  const moveSeries = await call('PUT', `/api/admin/pantone/${otherSeries.body?.id}`, { colorType: 'TPX', r: 0, g: 0, b: 0 });
+  ok('改系列後與同系列撞號被擋', moveSeries.status === 409, JSON.stringify(moveSeries.body));
+
+  const batch = await call('POST', '/api/admin/pantone/batch-delete', { ids: [otherSeries.body?.id, 999999] });
+  ok('批次刪除：能刪的刪、不存在的逐筆回報',
+    batch.body?.deleted === 1 && batch.body?.failed?.[0]?.id === 999999, JSON.stringify(batch.body));
+
+  const edited = await call('PUT', `/api/admin/pantone/${added.body.id}`, {
+    code: 'CHANGED', name: '改過的名字', colorType: 'TPX', r: 17, g: 34, b: 51,
+  });
+  ok('可編輯色票，色號不可變更', edited.body?.hex === '#112233' && edited.body?.name === '改過的名字'
+    && edited.body?.code === 'TEST-01', JSON.stringify(edited.body));
+
+  const scoped = await call('PUT', `/api/admin/pantone/${added.body.id}`, { ...color, scopeType: 'customers', customerIds: [] });
+  ok('指定客戶未選任何客戶被擋', scoped.status === 400, JSON.stringify(scoped.body));
+
+  const removed = await call('DELETE', `/api/admin/pantone/${added.body.id}`);
+  ok('可刪除色票', removed.status === 204, removed.status);
 }
 
 // ---------------------------------------------------------------- 前台可見性
@@ -473,7 +640,12 @@ section('前台取用（適用對象過濾）');
   token = loginB.body.token;
 
   const modelsB = await call('GET', '/api/models-3d');
-  ok('客戶 B 看不到客戶 A 專屬的模型', modelsB.body?.length === 1 && modelsB.body[0].name === 'T恤',
+  // B 自己也有一個同名的「球體」，所以不能用名稱判斷，要看 id
+  ok('客戶 B 看不到客戶 A 專屬的模型',
+    modelsB.body?.every((m) => m.id !== modelAId),
+    JSON.stringify(modelsB.body?.map((m) => `${m.id}:${m.name}`)));
+  ok('客戶 B 看得到自己的同名模型與全域模型',
+    modelsB.body?.length === 2 && modelsB.body.some((m) => m.name === '球體'),
     JSON.stringify(modelsB.body?.map((m) => m.name)));
 
   const specsB = await call('GET', '/api/weave-specs');
@@ -481,7 +653,7 @@ section('前台取用（適用對象過濾）');
 
   const patternsB = await call('GET', '/api/patterns');
   ok('客戶 B 看得到自己的圖庫',
-    patternsB.body?.items?.filter((p) => p.kind === 'customer').length === 2,
+    patternsB.body?.items?.filter((p) => p.kind === 'customer').length === 1,
     JSON.stringify(patternsB.body?.items?.map((p) => p.kind)));
 
   const rangeB = await call('GET', '/api/options');
@@ -489,6 +661,59 @@ section('前台取用（適用對象過濾）');
     rangeB.body?.specRange?.thicknessMax === 1.5, JSON.stringify(rangeB.body?.specRange));
 
   token = adminToken;
+}
+
+// ---------------------------------------------------------------- 10/22 調整
+
+section('停用（組織規格／背景）、客戶停用與刪除');
+{
+  const adminToken = token;
+  const asCustomerA = async (path) => {
+    const login = await call('POST', '/api/auth/login', { username: 'wang.min@xiaoyi.com', password: 'pass1234' });
+    token = login.body?.token ?? '';
+    const res = await call('GET', path);
+    token = adminToken;
+    return res;
+  };
+
+  const specOff = await call('PUT', `/api/admin/weave-specs/${weaveSpecId}/active`, { isActive: false });
+  ok('組織規格可停用', specOff.body?.isActive === false, JSON.stringify(specOff.body?.isActive));
+  ok('停用的組織規格前台看不到', (await asCustomerA('/api/weave-specs')).body?.length === 0);
+  const listed = await call('GET', '/api/admin/weave-specs');
+  ok('停用的組織規格後台仍看得到', listed.body?.items?.some((s) => s.id === weaveSpecId && s.isActive === false));
+  await call('PUT', `/api/admin/weave-specs/${weaveSpecId}/active`, { isActive: true });
+
+  const bgs = await call('GET', '/api/admin/backgrounds');
+  const bgId = bgs.body?.items?.[0]?.id;
+  const bgOff = await call('PUT', `/api/admin/backgrounds/${bgId}/active`, { isActive: false });
+  ok('背景可停用', bgOff.body?.isActive === false, JSON.stringify(bgOff.body));
+  ok('停用的背景前台看不到', (await asCustomerA('/api/backgrounds')).body?.length === 0);
+  await call('PUT', `/api/admin/backgrounds/${bgId}/active`, { isActive: true });
+
+  // 已登入的使用者先拿好 token，驗證停用後舊 token 也會被擋
+  const login = await call('POST', '/api/auth/login', { username: 'wang.min@xiaoyi.com', password: 'pass1234' });
+  const userToken = login.body.token;
+  await call('PUT', `/api/admin/customers/${customerA}/active`, { isActive: false });
+  const blockedLogin = await call('POST', '/api/auth/login', { username: 'wang.min@xiaoyi.com', password: 'pass1234' });
+  ok('公司停用後底下帳號無法登入', blockedLogin.status === 403, JSON.stringify(blockedLogin.body));
+  token = userToken;
+  const blockedToken = await call('GET', '/api/options');
+  token = adminToken;
+  ok('公司停用後已登入的 token 也被擋', blockedToken.status === 403, JSON.stringify(blockedToken.body));
+  await call('PUT', `/api/admin/customers/${customerA}/active`, { isActive: true });
+
+  const blocked = await call('DELETE', `/api/admin/customers/${customerA}`);
+  ok('有帳號等關聯資料的公司不得刪除', blocked.status === 400 && /帳號/.test(blocked.body?.error),
+    JSON.stringify(blocked.body));
+
+  const empty = await call('POST', '/api/admin/customers', { name: '建錯的公司', taxId: '99999999' });
+  const batch = await call('POST', '/api/admin/customers/batch-delete', { ids: [empty.body.id, customerA] });
+  ok('批次刪除公司：無關聯的刪除、有關聯的回報原因',
+    batch.body?.deleted === 1 && batch.body?.failed?.length === 1 && batch.body.failed[0].id === customerA,
+    JSON.stringify(batch.body));
+
+  const badBatch = await call('POST', '/api/admin/customers/batch-delete', { ids: [] });
+  ok('批次刪除未選任何資料被擋', badBatch.status === 400, JSON.stringify(badBatch.body));
 }
 
 // ---------------------------------------------------------------- 刪除

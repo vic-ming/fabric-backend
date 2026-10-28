@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
@@ -16,11 +17,24 @@ import patternRoutes from './routes/patterns.js';
 import weaveSpecRoutes from './routes/weave-specs.js';
 import { backgroundRoutes, model3dRoutes } from './routes/asset-library.js';
 import fileRoutes from './routes/files.js';
+import importRoutes from './routes/imports.js';
+import pantoneRoutes from './routes/pantone.js';
 import publicRoutes from './routes/public.js';
+
+// pino-pretty 只是開發時讓 log 好讀，沒裝就退回 JSON log，不讓伺服器起不來。
+function prettyTransport() {
+  if (!process.stdout.isTTY) return undefined;
+  try {
+    createRequire(import.meta.url).resolve('pino-pretty');
+    return { target: 'pino-pretty' };
+  } catch {
+    return undefined;
+  }
+}
 
 export async function buildServer() {
   const app = Fastify({
-    logger: { transport: process.stdout.isTTY ? { target: 'pino-pretty' } : undefined },
+    logger: { transport: prettyTransport() },
     bodyLimit: config.maxUploadBytes,
     // 所有路由都在 /api 底下。掛在子路徑跑的環境（cPanel 的 Node.js App 掛在
     // /api）有可能把該前綴從 req.url 去掉，這裡補回來，讓同一份程式在本機與
@@ -45,7 +59,9 @@ export async function buildServer() {
       return reply.code(400).send({ error: error.message });
     }
     if (error.code === 'FST_REQ_FILE_TOO_LARGE') {
-      return reply.code(413).send({ error: '上傳檔案超過大小上限' });
+      return reply.code(413).send({
+        error: `上傳檔案超過大小上限（${Math.round(config.maxUploadBytes / 1024 / 1024)} MB）`,
+      });
     }
     request.log.error(error);
     return reply.code(500).send({ error: '伺服器發生錯誤' });
@@ -73,6 +89,8 @@ export async function buildServer() {
   await app.register(weaveSpecRoutes);
   await app.register(backgroundRoutes);
   await app.register(model3dRoutes);
+  await app.register(pantoneRoutes);
+  await app.register(importRoutes);
 
   // 前台：登入即可，內容依所屬客戶過濾
   await app.register(publicRoutes);

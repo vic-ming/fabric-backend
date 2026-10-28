@@ -33,7 +33,13 @@ export function isWithinValidPeriod(account, day = today()) {
   return day >= from && day <= to;
 }
 
-export const accountStatus = (account) => (isWithinValidPeriod(account) ? 'active' : 'inactive');
+/** 所屬公司被停用時，底下的帳號一律不得登入（系統管理者不屬於任何公司，不受影響）。 */
+export const isCustomerDisabled = (account) => account.customer_id !== null && account.customer_active === false;
+
+/** 生效期間內、且沒有被人工停用，才算啟用。 */
+export const isAccountActive = (account) => account.is_active !== false && isWithinValidPeriod(account);
+
+export const accountStatus = (account) => (isAccountActive(account) ? 'active' : 'inactive');
 
 function readToken(request) {
   const header = request.headers.authorization ?? '';
@@ -54,13 +60,16 @@ export async function authenticate(request) {
   }
 
   const account = await one(
-    `select a.*, c.name as customer_name
+    `select a.*, c.name as customer_name, c.is_active as customer_active
        from accounts a
        left join customers c on c.id = a.customer_id
       where a.id = $1`,
     [payload.sub],
   );
   if (!account) throw unauthorized('帳號已不存在');
+  if (account.is_active === false) throw forbidden('帳號已停用');
+  // 已登入的使用者也要擋：token 還沒過期，但公司已在後台被停用
+  if (isCustomerDisabled(account)) throw forbidden('所屬公司已停用，請聯絡管理者');
   if (!isWithinValidPeriod(account)) throw forbidden('帳號已逾生效期間');
 
   request.user = {

@@ -5,9 +5,10 @@
 
 import { many, one, query } from '../db/index.js';
 import { accountStatus, hashPassword, requireAdmin, roleOf } from '../lib/auth.js';
+import { registerBatchDelete } from '../lib/batch-delete.js';
 import { toDateString } from '../lib/dates.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
-import { pageResult, parsePaging, requireDate, requireText } from '../lib/validate.js';
+import { pageResult, parsePaging, requireBool, requireDate, requireText } from '../lib/validate.js';
 
 const view = (row) => ({
   id: row.id,
@@ -19,6 +20,7 @@ const view = (row) => ({
   validFrom: toDateString(row.valid_from),
   validTo: toDateString(row.valid_to),
   status: accountStatus(row),
+  isActive: row.is_active,
 });
 
 const SELECT = `select a.*, c.name as customer_name
@@ -48,8 +50,9 @@ export default async function accountRoutes(app) {
       conditions.push(`a.customer_id = $${params.length}`);
     }
     // 狀態由生效期間推導，不另存欄位
-    if (status === 'active') conditions.push('current_date between a.valid_from and a.valid_to');
-    if (status === 'inactive') conditions.push('current_date not between a.valid_from and a.valid_to');
+    // 啟用 = 人工開關開著 且 在生效期間內
+    if (status === 'active') conditions.push('(a.is_active and current_date between a.valid_from and a.valid_to)');
+    if (status === 'inactive') conditions.push('(not a.is_active or current_date not between a.valid_from and a.valid_to)');
 
     const where = conditions.length ? `where ${conditions.join(' and ')}` : '';
     const rows = await many(
@@ -121,12 +124,37 @@ export default async function accountRoutes(app) {
     return view(await one(`${SELECT} where a.id = $1`, [current.id]));
   });
 
-  app.delete('/api/admin/accounts/:id', async (request, reply) => {
+  // 啟用／停用。與生效期間各自獨立：兩者都成立才算啟用。
+  app.put('/api/admin/accounts/:id/active', async (request) => {
     const id = Number(request.params.id);
+    if (id === request.user.id) throw badRequest('不可停用自己目前登入的帳號');
+    const current = await one(
+      `select a.*, c.name as customer_name
+         from accounts a left join customers c on c.id = a.customer_id
+        where a.id = $1`,
+      [id],
+    );
+    if (!current) throw notFound('帳號不存在');
+    const isActive = requireBool(request.body?.isActive, '啟用狀態');
+    const row = await one(
+      `update accounts set is_active = $2, updated_at = now() where id = $1
+       returning *, (select name from customers where id = customer_id) as customer_name`,
+      [id, isActive],
+    );
+    return view(row);
+  });
+
+  async function deleteAccount(id, request) {
     if (id === request.user.id) throw badRequest('不可刪除自己目前登入的帳號');
-    const current = await one('select id from accounts where id = $1', [id]);
+    const current = await one('select id, username from accounts where id = $1', [id]);
     if (!current) throw notFound('帳號不存在');
     await query('delete from accounts where id = $1', [id]);
+  }
+
+  app.delete('/api/admin/accounts/:id', async (request, reply) => {
+    await deleteAccount(Number(request.params.id), request);
     reply.code(204);
   });
+
+  registerBatchDelete(app, '/api/admin/accounts', deleteAccount);
 }
