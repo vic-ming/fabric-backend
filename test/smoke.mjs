@@ -488,6 +488,8 @@ let weaveSpecId;
     { multipart: true });
   ok('編輯時編號不可修改', edited.body?.code === 'F-0001', edited.body?.code);
   ok('布重已更新', edited.body?.weight === 210);
+  ok('編輯沒帶尺寸時保留原本的設計尺寸', edited.body?.designWidthCm === 3.965,
+    JSON.stringify(edited.body?.designWidthCm));
   ok('成分已替換為一項', edited.body?.compositions?.length === 1);
   ok('保留舊檔並新增一個', edited.body?.files?.length === 4, JSON.stringify(edited.body?.files?.map((f) => f.name)));
   ok('適用對象改為指定客戶', edited.body?.scopeType === 'customers' && edited.body.customers.length === 1);
@@ -606,6 +608,21 @@ section('前台取用（適用對象過濾）');
 {
   const adminToken = token;
 
+  const allSpecs = await call('GET', '/api/weave-specs');
+  const f0001 = allSpecs.body?.find((s) => s.code === 'F-0001');
+  ok('前台組織規格帶出設計尺寸與編碼',
+    f0001?.designWidthCm === 3.965 && f0001?.fabricTypeCode && f0001?.weaveCode,
+    JSON.stringify([f0001?.designWidthCm, f0001?.fabricTypeCode, f0001?.weaveCode]));
+  ok('前台組織規格依 .u3m 對應出貼圖通道',
+    f0001?.u3m?.textures?.base?.startsWith('/api/files/') && f0001?.u3m?.textures?.nrm
+      && f0001.u3m.packageEntries.some((e) => e.path === 'textures/F-0001_BASE.jpg'),
+    JSON.stringify(f0001?.u3m));
+
+  const privateColor = await call('POST', '/api/admin/pantone', {
+    code: 'ONLY-B', colorType: 'TPX', r: 1, g: 2, b: 3, scopeType: 'customers', customerIds: [customerB],
+  });
+  ok('新增客戶 B 專屬色票', privateColor.status === 201, JSON.stringify(privateColor.body));
+
   const loginA = await call('POST', '/api/auth/login', { username: 'wang.min@xiaoyi.com', password: 'pass1234' });
   token = loginA.body.token;
 
@@ -626,6 +643,10 @@ section('前台取用（適用對象過濾）');
   ok('客戶 A 看得到指定給自己的組織規格', specs.body?.length === 1, JSON.stringify(specs.body?.length));
 
   const patterns = await call('GET', '/api/patterns');
+  const colorsA = await call('GET', '/api/pantone');
+  ok('客戶 A 看不到客戶 B 專屬色票', colorsA.status === 200 && !colorsA.body.some((c) => c.code === 'ONLY-B'));
+  ok('OP 含量範圍一併回傳', options.body?.specRange?.opMax === 60, JSON.stringify(options.body?.specRange));
+
   ok('客戶 A 看不到別家客戶圖庫',
     patterns.body?.items?.every((p) => p.kind === 'general'),
     JSON.stringify(patterns.body?.items?.map((p) => `${p.kind}:${p.name}`)));
@@ -650,6 +671,9 @@ section('前台取用（適用對象過濾）');
 
   const specsB = await call('GET', '/api/weave-specs');
   ok('客戶 B 看不到客戶 A 專屬的組織規格', specsB.body?.length === 0, JSON.stringify(specsB.body?.length));
+
+  const colorsB = await call('GET', '/api/pantone');
+  ok('客戶 B 看得到自己的專屬色票', colorsB.body?.some((c) => c.code === 'ONLY-B'));
 
   const patternsB = await call('GET', '/api/patterns');
   ok('客戶 B 看得到自己的圖庫',

@@ -308,6 +308,9 @@ export default async function weaveSpecRoutes(app) {
         'select original_name from files where id = any($1::int[])', [kept],
       ).then((rows) => rows.map((r) => r.original_name));
       const size = applyU3m(dataFiles, { designWidthCm, designHeightCm }, keptNames);
+      // 後台編輯表單不帶尺寸欄位，沒給、也沒重傳 .u3m 時要保留原值，不能清成 null
+      size.designWidthCm ??= current.design_width_cm;
+      size.designHeightCm ??= current.design_height_cm;
 
       if (kept.length + dataFiles.length === 0) {
         throw badRequest('組織資料為必填，請至少保留或上傳一個檔案');
