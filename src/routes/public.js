@@ -64,7 +64,7 @@ async function u3mView(files) {
 }
 
 /** 產生「全域 或 屬於此客戶」的可見性條件。管理者（customerId 為 null）看全部。 */
-function visible(entityType, alias, customerId, paramIndex) {
+export function visible(entityType, alias, customerId, paramIndex) {
   if (customerId === null || customerId === undefined) return 'true';
   return `(${alias}.scope_type = 'global' or exists (
              select 1 from scope_customers sc

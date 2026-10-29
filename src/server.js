@@ -20,6 +20,7 @@ import fileRoutes from './routes/files.js';
 import importRoutes from './routes/imports.js';
 import pantoneRoutes from './routes/pantone.js';
 import publicRoutes from './routes/public.js';
+import ttriRoutes from './routes/ttri.js';
 
 // pino-pretty 只是開發時讓 log 好讀，沒裝就退回 JSON log，不讓伺服器起不來。
 function prettyTransport() {
@@ -94,6 +95,7 @@ export async function buildServer() {
 
   // 前台：登入即可，內容依所屬客戶過濾
   await app.register(publicRoutes);
+  await app.register(ttriRoutes);
 
   return app;
 }

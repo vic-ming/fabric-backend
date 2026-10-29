@@ -3,12 +3,41 @@
 // 執行前會清空資料庫，請勿對正式環境執行。
 
 import { rm } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 
 process.env.DB_DATA_DIR = resolve('.data/test-pglite');
 process.env.UPLOAD_DIR = resolve('.data/test-uploads');
 process.env.PORT = '0';
 process.env.SEED_ON_BOOT = 'true';
+
+// 假的紡織所 API：記下收到的請求，回傳與正式環境相同格式的資料
+const ttriCalls = [];
+const ttriServer = createServer((req, res) => {
+  const url = new URL(req.url, 'http://ttri');
+  ttriCalls.push({ path: url.pathname, query: Object.fromEntries(url.searchParams), auth: req.headers.authorization });
+  const send = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+  if (req.headers.authorization !== 'Bearer fake-ttri-token') return send(401, { detail: 'Account is inactive or no longer exists.' });
+  if (url.pathname === '/Specs2VS') {
+    return send(200, {
+      SampleCode: '2-0000437', Name: '2-0000437-2', MachineType: 'Matched', Thickness: 0.6, MassDensity: 330,
+      BendRigidityWeft: 121.2, BendRigidityWarp: 154.5, StretchRigidityWeft: 97.2, StretchRigidityWarp: 169.4,
+      StretchRigidityShear: 38.1, StretchLinearityWeft: 50, StretchLinearityWarp: 50, StretchLinearityShear: 20,
+    });
+  }
+  const id = url.searchParams.get('id');
+  if (url.pathname === '/buildU3M') return send(200, { '.': [`${id}.json`, `${id}.u3m`] });
+  if (url.pathname === '/downloadFILE') {
+    const file = url.searchParams.get('filename');
+    if (file.endsWith('.json')) return send(200, { custom: { browzwear: { mass: 330 } } });
+    return send(200, { material: { name: file, front: { basecolor: { texture: { image: { path: 'textures/x_BASE.jpg' } } } } } });
+  }
+  return send(404, { detail: 'Not Found' });
+});
+await new Promise((resolve) => ttriServer.listen(0, '127.0.0.1', resolve));
+process.env.TTRI_API_BASE_URL = `http://127.0.0.1:${ttriServer.address().port}`;
+process.env.TTRI_API_TOKEN = 'fake-ttri-token';
+process.env.TTRI_MIN_INTERVAL_MS = '0';
 
 await rm(process.env.DB_DATA_DIR, { recursive: true, force: true });
 await rm(process.env.UPLOAD_DIR, { recursive: true, force: true });
@@ -687,6 +716,61 @@ section('前台取用（適用對象過濾）');
   token = adminToken;
 }
 
+// ---------------------------------------------------------------- 紡織所 API
+
+section('紡織所 API 轉發');
+{
+  const adminToken = token;
+  const loginA = await call('POST', '/api/auth/login', { username: 'wang.min@xiaoyi.com', password: 'pass1234' });
+  token = loginA.body.token;
+  const els = (await call('GET', '/api/options')).body.elasticities;
+  const fourWay = els.find((e) => e.name === '四向彈性');
+
+  const spec = {
+    weaveId, weight: 330, thickness: 0.6, opPercentage: 8, elasticityId: fourWay.id,
+    compositions: [{ code: 'ZZ', percent: 30 }, { code: 'PES', percent: 70 }],
+  };
+  ttriCalls.length = 0;
+  const vs = await call('POST', '/api/ttri/specs2vs', spec);
+  ok('Specs2VS 回傳物性與建議布樣', vs.status === 200 && vs.body.sampleCode === '2-0000437'
+    && vs.body.physics.BendRigidityWarp === 154.5, JSON.stringify(vs.body));
+  const q = ttriCalls[0]?.query ?? {};
+  ok('組織 id 轉成組織代碼、主成分取比例最高者',
+    q.Product_ConstructionCode === 'PLAIN' && q.Product_YarnMaterial_1 === 'PES' && q.Product_YarnMaterial_1_Value === '70',
+    JSON.stringify(q));
+  ok('彈性名稱對應到 StretchDirection', q.Product_StretchDirection === '4 way stretch', JSON.stringify(q));
+  ok('token 由後端補上', ttriCalls[0]?.auth === 'Bearer fake-ttri-token');
+  ok('成分轉成英文組成描述', vs.body.compositionText === '70%Polyester, 30%Cotton', vs.body.compositionText);
+
+  const outOfRange = await call('POST', '/api/ttri/specs2vs', { ...spec, weight: 5 });
+  ok('超出紡織所輸入範圍被擋', outOfRange.status === 400, JSON.stringify(outOfRange.body));
+  const badComp = await call('POST', '/api/ttri/specs2vs', { ...spec, compositions: [{ code: 'NOPE', percent: 100 }] });
+  ok('不存在的成分被擋', badComp.status === 400, JSON.stringify(badComp.body));
+
+  ttriCalls.length = 0;
+  const built = await call('POST', '/api/ttri/u3m', {
+    weaveId, compositionText: vs.body.compositionText, physics: vs.body.physics,
+  });
+  ok('buildU3M 後取回 physics 與 u3m', built.status === 200 && built.body.physics?.custom && built.body.u3m?.material,
+    JSON.stringify(built.body));
+  ok('依序打 buildU3M、downloadFILE ×2',
+    ttriCalls.map((c) => `${c.path}:${c.query.filename ?? ''}`).join() === `/buildU3M:,/downloadFILE:${built.body.id}.json,/downloadFILE:${built.body.id}.u3m`,
+    JSON.stringify(ttriCalls.map((c) => c.path)));
+  ok('buildU3M 不封裝貼圖、帶入物性', ttriCalls[0]?.query.withTextures === 'false'
+    && ttriCalls[0]?.query.MassDensity === '330' && ttriCalls[0]?.query.Construction === 'PLAIN', JSON.stringify(ttriCalls[0]?.query));
+
+  const missing = await call('POST', '/api/ttri/u3m', { weaveId, physics: { MassDensity: 330 } });
+  ok('物性欄位不齊被擋', missing.status === 400, JSON.stringify(missing.body));
+
+  const { config } = await import('../src/config.js');
+  config.ttri.token = 'wrong-token';
+  const denied = await call('POST', '/api/ttri/specs2vs', spec);
+  ok('紡織所拒絕時回 502（不能回 401，否則前台會被登出）', denied.status === 502, JSON.stringify(denied.body));
+  config.ttri.token = 'fake-ttri-token';
+
+  token = adminToken;
+}
+
 // ---------------------------------------------------------------- 10/22 調整
 
 section('停用（組織規格／背景）、客戶停用與刪除');
@@ -760,4 +844,5 @@ section('刪除');
 console.log(`\n${'-'.repeat(48)}`);
 console.log(`通過 ${passed}　失敗 ${failed}`);
 await app.close();
+ttriServer.close();
 process.exit(failed === 0 ? 0 : 1);
