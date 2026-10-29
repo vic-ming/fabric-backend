@@ -55,7 +55,9 @@ async function send(path, params) {
     });
   } catch (error) {
     const reason = error.name === 'TimeoutError' ? '逾時' : '連線失敗';
-    throw upstreamError(`紡織所 API ${reason}（${path}）`);
+    // 底層原因（ECONNREFUSED、EHOSTUNREACH…）一併帶出，才分得出是主機擋對外連線還是對方沒開
+    const cause = error.cause?.code ?? error.cause?.message ?? error.message;
+    throw upstreamError(`紡織所 API ${reason}（${path}）`, { cause });
   }
 
   const text = await response.text();
